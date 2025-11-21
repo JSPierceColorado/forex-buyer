@@ -27,12 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------
-# Google Sheets helpers
+# Google Sheets (optional logging only)
 # ------------------------
 
 def get_gspread_client() -> gspread.Client:
     """Authenticate to Google Sheets using a service account JSON in env GOOGLE_CREDS_JSON."""
-    creds_json = os.environ["GOOGLE_CREDS_JSON"]
+    creds_json = os.environ.get("GOOGLE_CREDS_JSON")
+    if not creds_json:
+        raise RuntimeError("GOOGLE_CREDS_JSON not set")
     info = json.loads(creds_json)
     credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
     client = gspread.authorize(credentials)
@@ -41,10 +43,15 @@ def get_gspread_client() -> gspread.Client:
 
 def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -> None:
     """
-    Create/replace the screener tab data in columns starting at A ONLY.
-    Columns to the right of the DataFrame are left untouched so user formulas & notes persist.
+    Write screener results to a Google Sheet for visibility only.
+    This is NOT used as input for trading logic.
     """
-    gc = get_gspread_client()
+    try:
+        gc = get_gspread_client()
+    except Exception as exc:
+        logger.warning("Skipping sheet write (auth issue): %s", exc)
+        return
+
     sh = gc.open(sheet_name)
 
     try:
@@ -53,10 +60,9 @@ def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -
         ws = sh.add_worksheet(
             title=tab_name,
             rows=str(len(df) + 100),
-            cols="30",  # give some room for user columns (R+)
+            cols="30",
         )
 
-    # Build values for our data columns
     header = df.columns.tolist()
     data_rows = df.fillna("").astype(str).values.tolist()
     values = [header] + data_rows
@@ -64,16 +70,13 @@ def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -
     num_data_rows = len(values)
     num_data_cols = len(header)
 
-    # Make sure we cover all existing rows in our data columns so old data gets cleared
     max_rows = max(ws.row_count, num_data_rows)
     blank_grid = [[""] * num_data_cols for _ in range(max_rows)]
 
-    # Overlay our header + data at the top of the blank grid
     for r, row in enumerate(values):
         for c, val in enumerate(row):
             blank_grid[r][c] = val
 
-    # Update starting at A1, only for our data columns
     ws.update(range_name="A1", values=blank_grid)
     logger.info(
         "Updated sheet '%s' tab '%s' with %d data rows",
@@ -331,7 +334,6 @@ def compute_ut_trailing_stop(
 
     stop = pd.Series(index=price.index, dtype=float)
 
-    # Initialize stop similar to Pine: price - entryLoss
     entry_loss0 = atr_mult * atr.iloc[first_valid]
     prev_stop = price.iloc[first_valid] - entry_loss0
     stop.iloc[first_valid] = prev_stop
@@ -343,16 +345,12 @@ def compute_ut_trailing_stop(
         entry_loss = atr_mult * atr.iloc[i]
 
         if p > prev_stop and p1 > prev_stop:
-            # Long regime: trail up, never down
             stop_val = max(prev_stop, p - entry_loss)
         elif p < prev_stop and p1 < prev_stop:
-            # Short regime: trail down, never up
             stop_val = min(prev_stop, p + entry_loss)
         elif p > prev_stop:
-            # Flip to long
             stop_val = p - entry_loss
         else:
-            # Flip to short
             stop_val = p + entry_loss
 
         stop.iloc[i] = stop_val
@@ -383,10 +381,9 @@ def compute_buy_signal_and_metrics(
 
     Returns a dict with metrics if conditions are met, otherwise None.
     """
-    if len(h1_closes) < 20:  # minimal sanity check
+    if len(h1_closes) < 20:
         return None
 
-    # 1) ATR & trailing stop on H1
     atr_series = compute_atr_series(h1_highs, h1_lows, h1_closes, period=10)
     if atr_series is None:
         return None
@@ -395,13 +392,11 @@ def compute_buy_signal_and_metrics(
     if stop_series is None:
         return None
 
-    # Need at least 2 valid stop values to detect crossover
     if stop_series.isna().sum() > len(stop_series) - 2:
         return None
 
     last_idx = len(h1_closes) - 1
 
-    # Ensure last two stops are not NaN
     if pd.isna(stop_series.iloc[last_idx]) or pd.isna(stop_series.iloc[last_idx - 1]):
         return None
 
@@ -410,19 +405,16 @@ def compute_buy_signal_and_metrics(
     stop_prev = stop_series.iloc[last_idx - 1]
     stop_last = stop_series.iloc[last_idx]
 
-    # Buy condition (equivalent to ta.crossover(price, stop) && price > stop)
     crossed_up = price_prev <= stop_prev and price_last > stop_last
     buy_signal = crossed_up and (price_last > stop_last)
 
     if not buy_signal:
         return None
 
-    # 2) Daily SMA 240 as "buy zone"
     daily_ma = compute_daily_sma(daily_closes, length=240)
     if daily_ma is None or daily_ma <= 0:
         return None
 
-    # Require price be BELOW the daily SMA
     below_ma = price_last < daily_ma
     if not below_ma:
         return None
@@ -441,127 +433,24 @@ def compute_buy_signal_and_metrics(
 
 
 # ------------------------
-# Screener row builder
-# ------------------------
-
-def build_instrument_row(
-    session: requests.Session,
-    base_url: str,
-    instrument_name: str,
-) -> Optional[Dict[str, Any]]:
-    """
-    For a single FX instrument:
-      - Get H1 data for UT-style trailing stop and buy signal.
-      - Get daily data for 240-SMA.
-      - Return a row ONLY if buy signal is present and price < SMA240.
-    """
-    # Daily data for SMA 240
-    daily_closes, _, _, _ = fetch_candles(
-        session, base_url, instrument_name, granularity="D", count=300
-    )
-
-    # H1 data for ATR/trailing stop
-    h1_closes, h1_highs, h1_lows, _ = fetch_candles(
-        session, base_url, instrument_name, granularity="H1", count=400
-    )
-
-    if not daily_closes or not h1_closes:
-        logger.warning("Missing data for %s", instrument_name)
-        return None
-
-    metrics = compute_buy_signal_and_metrics(
-        h1_closes=h1_closes,
-        h1_highs=h1_highs,
-        h1_lows=h1_lows,
-        daily_closes=daily_closes,
-    )
-
-    # Only keep instruments that satisfy the UT buy + below SMA240
-    if metrics is None:
-        return None
-
-    row = {
-        "pair": instrument_name,
-        "last_price": metrics["last_price"],
-        "daily_MA240": metrics["daily_ma240"],
-        "%_below_MA240": metrics["pct_below_ma"],
-        "H1_ATR10": metrics["h1_atr10"],
-        "H1_trailing_stop": metrics["h1_trailing_stop"],
-        "buy_signal_H1": metrics["buy_signal_h1"],
-        "updated_at": pd.Timestamp.utcnow().isoformat(),
-    }
-
-    return row
-
-
-# ------------------------
-# Combined screener + buyer
+# One-pass screener + buyer
 # ------------------------
 
 def run_bot_once():
     """
-    - Scan all tradable FX instruments on Oanda.
-    - For each that has:
-        * UT-style H1 buy signal, AND
-        * price below 240-day SMA,
-      we:
-        * Log it in a Google Sheet (optional visibility), and
-        * Immediately place a MARKET BUY sized at BUYER_ALLOCATION_PERCENT% of marginAvailable.
+    Fully autonomous cycle:
+      - Scan all tradable FX instruments on Oanda.
+      - For each:
+          * Compute UT-style H1 buy signal + below 240-day SMA.
+          * If conditions are met:
+              - Compute position size as BUYER_ALLOCATION_PERCENT% of marginAvailable.
+              - Place a MARKET BUY and move to the next pair.
+      - Optionally log all candidates to a Google Sheet (for visibility only).
     """
     session, base_url = get_oanda_session()
     account_id = os.environ["OANDA_ACCOUNT_ID"]
 
-    # 1) Screener: find all candidates in this run
     fx_instruments = fetch_instruments(session, base_url, account_id)
-
-    screener_rows: List[Dict[str, Any]] = []
-
-    for ins in fx_instruments:
-        name = ins.get("name")
-        if not name:
-            continue
-        try:
-            logger.info("Screening %s", name)
-            row = build_instrument_row(session, base_url, name)
-            if row:
-                screener_rows.append(row)
-        except Exception as exc:
-            logger.exception("Failed to build row for %s: %s", name, exc)
-
-    # Build DataFrame for logging / sheet output
-    columns = [
-        "pair",
-        "last_price",
-        "daily_MA240",
-        "%_below_MA240",
-        "H1_ATR10",
-        "H1_trailing_stop",
-        "buy_signal_H1",
-        "updated_at",
-    ]
-
-    if screener_rows:
-        df = pd.DataFrame(screener_rows)[columns]
-    else:
-        df = pd.DataFrame(columns=columns)
-
-    # 2) Write screener output to sheet (for visibility only)
-    sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
-    screener_tab = os.getenv("OANDA_UT_SCREENER_TAB", "Oanda-UT-Screener")
-    try:
-        write_dataframe_to_sheet(df, sheet_name, screener_tab)
-    except Exception as exc:
-        logger.exception("Failed to write screener results to sheet: %s", exc)
-
-    if not screener_rows:
-        logger.info("No UT-style buy + below-MA240 setups this run; no trades placed.")
-        return
-
-    logger.info("Found %d screener candidates this run.", len(screener_rows))
-
-    # 3) Buyer: immediately trade the candidates
-
-    # Pip locations from instruments list
     pip_map = build_pip_location_map_from_instruments(fx_instruments)
 
     # Account summary (use marginAvailable as 'available funds')
@@ -588,12 +477,87 @@ def run_bot_once():
         notional_per_trade,
     )
 
-    # Fetch pricing for all candidate instruments in one call
-    instruments_to_trade = [row["pair"] for row in screener_rows]
-    prices = fetch_pricing(session, base_url, account_id, instruments_to_trade)
+    screener_rows: List[Dict[str, Any]] = []
+
+    # First: determine all candidates and collect their pairs
+    candidate_pairs: List[str] = []
+
+    for ins in fx_instruments:
+        name = ins.get("name")
+        if not name:
+            continue
+        try:
+            logger.info("Evaluating %s", name)
+
+            # Daily data for SMA 240
+            daily_closes, _, _, _ = fetch_candles(
+                session, base_url, name, granularity="D", count=300
+            )
+
+            # H1 data for ATR/trailing stop
+            h1_closes, h1_highs, h1_lows, _ = fetch_candles(
+                session, base_url, name, granularity="H1", count=400
+            )
+
+            if not daily_closes or not h1_closes:
+                logger.warning("Missing data for %s", name)
+                continue
+
+            metrics = compute_buy_signal_and_metrics(
+                h1_closes=h1_closes,
+                h1_highs=h1_highs,
+                h1_lows=h1_lows,
+                daily_closes=daily_closes,
+            )
+
+            if metrics is None:
+                continue
+
+            row = {
+                "pair": name,
+                "last_price": metrics["last_price"],
+                "daily_MA240": metrics["daily_ma240"],
+                "%_below_MA240": metrics["pct_below_ma"],
+                "H1_ATR10": metrics["h1_atr10"],
+                "H1_trailing_stop": metrics["h1_trailing_stop"],
+                "buy_signal_H1": metrics["buy_signal_h1"],
+                "updated_at": pd.Timestamp.utcnow().isoformat(),
+            }
+            screener_rows.append(row)
+            candidate_pairs.append(name)
+
+        except Exception as exc:
+            logger.exception("Failed to evaluate %s: %s", name, exc)
+
+    # Optional: write candidates to sheet for visibility
+    columns = [
+        "pair",
+        "last_price",
+        "daily_MA240",
+        "%_below_MA240",
+        "H1_ATR10",
+        "H1_trailing_stop",
+        "buy_signal_H1",
+        "updated_at",
+    ]
+    df = pd.DataFrame(screener_rows, columns=columns) if screener_rows else pd.DataFrame(columns=columns)
+
+    sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
+    screener_tab = os.getenv("OANDA_UT_SCREENER_TAB", "Oanda-UT-Screener")
+    if os.environ.get("GOOGLE_CREDS_JSON"):
+        write_dataframe_to_sheet(df, sheet_name, screener_tab)
+
+    if not candidate_pairs:
+        logger.info("No UT-style buy + below-MA240 setups this run; no trades placed.")
+        return
+
+    logger.info("Found %d candidates this run; fetching prices and placing trades.", len(candidate_pairs))
+
+    prices = fetch_pricing(session, base_url, account_id, candidate_pairs)
 
     trades_placed = 0
 
+    # Now: for each candidate, size and place the order
     for row in screener_rows:
         pair = row["pair"]
         price_info = prices.get(pair)
@@ -602,17 +566,15 @@ def run_bot_once():
             continue
 
         ask = price_info["ask"]
-        pip_loc = pip_map.get(pair, -4)  # fallback pipLocation=-4
+        pip_loc = pip_map.get(pair, -4)
 
         rounded_price = round_price_to_pip(ask, pip_loc)
         if rounded_price <= 0:
             logger.warning("Rounded ask price for %s is non-positive (%.8f); skipping", pair, rounded_price)
             continue
 
-        # allocation% of available funds per pair => notional / price = units
         units = int(round(notional_per_trade / rounded_price))
 
-        # Minimum 1-unit fallback
         if units <= 0 and notional_per_trade > 0:
             logger.info(
                 "Computed units < 1 for %s (notional=%.4f, price=%.8f); using minimum 1 unit instead.",
@@ -659,8 +621,6 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    # Single interval for the full cycle (screen + buy).
-    # You can reuse UT_SCREENER_INTERVAL_SECONDS env var, or override with UT_BOT_INTERVAL_SECONDS.
     interval_seconds = int(
         os.getenv(
             "UT_BOT_INTERVAL_SECONDS",
