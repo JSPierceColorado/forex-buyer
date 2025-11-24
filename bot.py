@@ -2,7 +2,7 @@ import os
 import json
 import time
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 import requests
 import pandas as pd
@@ -225,6 +225,33 @@ def place_market_order(
     resp.raise_for_status()
     data = resp.json()
     return data
+
+
+def fetch_open_positions(
+    session: requests.Session,
+    base_url: str,
+    account_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch open positions from Oanda and return a map:
+      { "EUR_USD": position_dict, ... }
+
+    We'll use this to detect if we are already LONG on a given instrument.
+    """
+    url = f"{base_url}/accounts/{account_id}/openPositions"
+    resp = session.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+    positions = data.get("positions", [])
+
+    pos_map: Dict[str, Dict[str, Any]] = {}
+    for p in positions:
+        inst = p.get("instrument")
+        if not inst:
+            continue
+        pos_map[inst] = p
+
+    return pos_map
 
 
 # ------------------------
@@ -456,6 +483,7 @@ def run_bot_once():
         * If conditions are met:
             - Size a LONG position as BUYER_ALLOCATION_PERCENT% of marginAvailable.
             - Place a MARKET BUY order.
+    - Only place one LONG per instrument; shorts are allowed.
     - Log results to a Google Sheets tab (for visibility only).
     """
     session, base_url = get_oanda_session()
@@ -489,6 +517,28 @@ def run_bot_once():
         margin_available,
         allocation_percent,
         notional_per_trade,
+    )
+
+    # Fetch existing open positions so we don't stack multiple longs per instrument
+    open_positions = fetch_open_positions(session, base_url, account_id)
+
+    instruments_with_long: Set[str] = set()
+    for inst, pos in open_positions.items():
+        long_info = pos.get("long", {})
+        units_str = str(long_info.get("units", "0"))
+        try:
+            long_units = int(units_str)
+        except Exception:
+            long_units = 0
+
+        # If there are any long units > 0, consider this instrument "already long"
+        if long_units > 0:
+            instruments_with_long.add(inst)
+
+    logger.info(
+        "Currently long on %d instruments: %s",
+        len(instruments_with_long),
+        ", ".join(sorted(instruments_with_long)) if instruments_with_long else "none",
     )
 
     # First pass: find all candidates with LONG signals
@@ -554,6 +604,30 @@ def run_bot_once():
             order_status = "NOT_ATTEMPTED"
             long_units: Optional[int] = None
             entry_price_used: Optional[float] = None
+
+            # Skip if we're already long on this instrument
+            if pair in instruments_with_long:
+                logger.info(
+                    "Already long on %s; skipping new LONG order for this bot run.",
+                    pair,
+                )
+                order_status = "SKIPPED_ALREADY_LONG"
+
+                row = {
+                    "pair": pair,
+                    "last_price": metrics["last_price"],
+                    "daily_MA240": metrics["daily_ma240"],
+                    "%_below_MA240": metrics["pct_below_ma"],
+                    "H1_ATR10": metrics["h1_atr10"],
+                    "H1_trailing_stop": metrics["h1_trailing_stop"],
+                    "buy_signal_H1": metrics["buy_signal_h1"],
+                    "long_units": "",
+                    "entry_price_used": "",
+                    "order_status": order_status,
+                    "updated_at": now_str,
+                }
+                rows_for_sheet.append(row)
+                continue
 
             try:
                 price_info = price_map.get(pair)
